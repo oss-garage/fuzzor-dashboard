@@ -6,6 +6,11 @@ on:
   push:
     branches: [master]
   workflow_dispatch:
+    inputs:
+      full_scrape:
+        description: 'Scrape every campaign again instead of reusing completed ones from the last run'
+        type: boolean
+        default: false
 
 jobs:
   scrape:
@@ -16,13 +21,21 @@ jobs:
       - name: Checkout master
         uses: actions/checkout@v4
 
+      - name: Checkout last published data
+        if: ${{ !inputs.full_scrape }}
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: previous
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.x'
 
       - name: Scrape data
-        run: python scrape.py http://bitcoind-fuzz.dergoegge.de:8000/ -p bitcoin
+        run: python scrape.py http://bitcoind-fuzz.dergoegge.de:8000/ -p bitcoin --previous previous
 
       - name: Prepare publish directory
         run: |

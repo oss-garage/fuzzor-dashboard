@@ -131,7 +131,7 @@ def campaign_status(campaign_data):
             last_ts = last_ts.replace(tzinfo=timezone.utc)
         age = (datetime.now(timezone.utc) - last_ts).total_seconds()
         return "stopped" if age > ONE_DAY_SECONDS else "running"
-    return "running"
+    return "stopped"
 
 
 def scrape_campaign(campaign_url, cid):
@@ -171,8 +171,26 @@ def discover_harness_campaigns(harnesses_url, name):
         return name, []
 
 
-def scrape_project(base_url, project, pool):
-    """Scrape all harnesses/campaigns for a single project."""
+def load_completed_campaigns(previous_dir, project, harness):
+    """Return campaigns from a previous run's output that are complete (have
+    coverage and stats), keyed by id."""
+    if previous_dir is None:
+        return {}
+    path = os.path.join(previous_dir, "data", project, f"{harness}.json")
+    try:
+        with open(path) as f:
+            campaigns = json.load(f)["campaigns"]
+    except (OSError, ValueError, KeyError):
+        return {}
+    return {c["id"]: c for c in campaigns
+            if c.get("coverage") is not None and c.get("stats")}
+
+
+def scrape_project(base_url, project, pool, previous_dir=None):
+    """Scrape all harnesses/campaigns for a single project.
+
+    Completed campaigns found in *previous_dir* are reused instead of scraped.
+    """
     harnesses_url = f"{base_url}/{project}/harnesses/"
     try:
         harness_names = list_dir(harnesses_url)
@@ -189,33 +207,44 @@ def scrape_project(base_url, project, pool):
         name, cids = fut.result()
         harness_cids[name] = cids
 
-    # Phase 2: scrape all campaigns in parallel
+    # Phase 2: scrape new and unfinished campaigns in parallel, reuse
+    # completed ones from the previous run
+    reused = {}
     campaign_futures = {}
     for name, cids in harness_cids.items():
         campaigns_url = f"{harnesses_url}{name}/campaigns/"
+        completed = load_completed_campaigns(previous_dir, project, name)
+        reused[name] = []
         futs = []
         for cid in cids:
-            futs.append(
-                pool.submit(scrape_campaign, f"{campaigns_url}{cid}/", cid)
-            )
+            if cid in completed:
+                reused[name].append(completed[cid])
+            else:
+                futs.append(
+                    pool.submit(scrape_campaign, f"{campaigns_url}{cid}/", cid)
+                )
         campaign_futures[name] = futs
 
     # Collect results
     result = {}
     for name in harness_names:
-        campaigns = [f.result() for f in campaign_futures.get(name, [])]
+        campaigns = reused.get(name, []) + [
+            f.result() for f in campaign_futures.get(name, [])
+        ]
         campaigns.sort(
             key=lambda c: c["stats"][0]["timestamp"] if c["stats"] else ""
         )
         result[name] = {"campaigns": campaigns}
         total_pts = sum(len(c["stats"]) for c in campaigns)
         print(f"    {name}: {len(campaigns)} campaign(s), "
+              f"{len(reused.get(name, []))} reused, "
               f"{total_pts} data points", file=sys.stderr)
 
     return result
 
 
-def scrape_endpoint(endpoint, only_projects=None, pool=None):
+def scrape_endpoint(endpoint, only_projects=None, pool=None,
+                    previous_dir=None):
     """Discover projects at *endpoint* and scrape each one.
 
     If *only_projects* is given, only scrape projects whose names are in the set.
@@ -234,7 +263,7 @@ def scrape_endpoint(endpoint, only_projects=None, pool=None):
             continue
         # Each top-level directory is a project
         print(f"  Project: {entry}", file=sys.stderr)
-        harness_data = scrape_project(endpoint, entry, pool)
+        harness_data = scrape_project(endpoint, entry, pool, previous_dir)
         if entry in projects:
             projects[entry]["harnesses"].update(harness_data)
         else:
@@ -263,7 +292,18 @@ def main():
         "-w", "--workers", type=int, default=4,
         help="Number of parallel fetch threads (default: 4)",
     )
+    parser.add_argument(
+        "--previous", metavar="DIR",
+        help="Output directory of a previous run; completed campaigns found "
+             "there are reused instead of scraped again",
+    )
     args = parser.parse_args()
+
+    previous_dir = args.previous
+    if previous_dir and not os.path.isdir(os.path.join(previous_dir, "data")):
+        print(f"No previous data in {previous_dir}, scraping everything",
+              file=sys.stderr)
+        previous_dir = None
 
     all_projects = {}
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
@@ -271,7 +311,7 @@ def main():
             print(f"Scraping {endpoint}", file=sys.stderr)
             only = set(args.projects) if args.projects else None
             projects = scrape_endpoint(endpoint, only_projects=only,
-                                       pool=pool)
+                                       pool=pool, previous_dir=previous_dir)
             for pname, pdata in projects.items():
                 if pname in all_projects:
                     all_projects[pname]["harnesses"].update(
